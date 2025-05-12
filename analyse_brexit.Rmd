@@ -1,0 +1,921 @@
+---
+title: "Analysis of subsidies granted as part of the frenche BREXIT exit plan"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Preparation of the data
+
+```{r}
+
+source("https://www.dropbox.com/s/lzdnoe69iex1le1/load_packages.R?dl=1") #Load packages
+
+load_packages("lubridate",
+              "tidyverse",
+              "readxl",
+              "openxlsx",
+              "janitor",
+              "gfwr",
+              "sf",
+              "plotly",
+              "kableExtra", 
+              "mapview", 
+              "rnaturaearth",
+              "egg",
+              "foreach", 
+              "devtools",
+              "viridis")
+
+#devtools::install_github("ropensci/rnaturalearth")
+#library(rnaturalearth)
+
+source("script/make_grid_gfw.R")
+source("script/trajectory_with_events_gfw.R")
+source("script/fishing_eez_summary.R")
+
+```
+
+We load the Exclusive Economic Zone shapefiles 
+
+```{r}
+
+url <- "https://www.dropbox.com/scl/fo/99nqe5od6hlc4urug5dmt/ANSFN9m2wHBuVvQOs3O1Lgg?rlkey=ni426isn7pgs4jt9x9nn9u1qn&dl=1"
+
+download.file(url, destfile = "data/raw/shapefiles/eez.zip")
+unzip("data/raw/shapefiles/eez.zip", exdir = "data/raw/shapefiles")
+
+eez <- st_read(dsn = "data/raw/shapefiles", layer = "eez_v11", quiet = T) %>%
+  clean_names () %>%
+  filter (mrgid %in% c(5677, 5696, 21788, 21789, 5681)) 
+
+```
+
+We load subsidies data 
+
+```{r}
+
+at_brexit <- read.xlsx("data/raw/liste des bénéficiaires/Liste des bénéficiaires finaux AT Brexit.xlsx") %>%
+  row_to_names(2) %>%
+  clean_names () %>%
+  mutate_at(vars(matches("date")), ~as.Date(as.numeric(.), origin = "1899-12-30")) %>%
+  mutate_at(vars(matches("montant")), ~gsub(" |€", "", .)) %>%
+  mutate_at(vars(matches("montant")), ~as.numeric(str_replace(., ",", "."))) %>%
+  mutate(numero_de_navire = ifelse(numero_de_navire == "FRA914388", "FRA000914388", numero_de_navire)) %>%
+  rename(cfr = "numero_de_navire",
+         debut_operation = "date_previsionnelle_debut_doperation",
+         fin_operation = "date_previsionnelle_fin_doperation", 
+         code_postal = "code_postal_de_loperation",
+         beneficiaire = "code_nature_beneficiaire_p_m",
+         numero_dossier = "numero_de_dossier_initial", 
+         intitule_operation = "intitule_de_loperation",
+         description_operation = "description_de_loperation",
+         depenses_eligibles = "montant_total_depenses_eligibles",
+         montant_aide_publique  = "montant_de_laide_publique") %>%
+  select(-montant_au_titre_du_regime_daide_sa_62426)
+
+
+pai_brexit <- read.xlsx("data/raw/liste des bénéficiaires/Liste des bénéficiaires finaux PAI - 86 navires-3_1.xlsx") %>%
+  row_to_names (2) %>%
+  clean_names () %>%
+  mutate_at(vars(matches("date")), ~as.Date(as.numeric(.), origin = "1899-12-30")) %>%
+  mutate_at(vars(matches("montant")), ~gsub(" |€", "", .)) %>%
+  mutate_at(vars(matches("montant")), ~as.numeric(str_replace(., ",", "."))) %>%
+  mutate(numero_cfr = toupper(numero_cfr),
+         numero_cfr = str_replace(numero_cfr, "^(FR)(A)?(0){2,5}([0-9]{6})", "FRA000\\4"),
+         numero_cfr = ifelse(numero_cfr == "FRA0005288889", "FRA000528889", numero_cfr)) %>%
+  rename(cfr = "numero_cfr",
+         debut_operation = "date_previsionnelle_debut_doperation",
+         fin_operation = "date_previsionnelle_fin_doperation", 
+         code_postal = "code_postal_de_loperation",
+         beneficiaire = "code_nature_beneficiaire_p_m",
+         numero_dossier = "numero_de_dossier_initial", 
+         intitule_operation = "intitule_de_loperation",
+         description_operation = "description_de_loperation",
+         depenses_eligibles = "montant_total_depenses_eligibles",
+         montant_aide_publique  = "montant_de_laide_publique") %>%
+  select(-montant_au_titre_du_regime_daide_sa_104347, -immatriculation_navire) # immatriculation_navire donne les mêmes informations que le cfr sauf pour 4 dossiers (PFEA900222DM0540010, PFEA900222DM0540001, PFEA900222DM0720001, PFEA900223DM0250011) pour lesquels le matricule du navire est différent. Dans trois des quatre cas, le matricule ne match pas avec le registre alors que le cfr oui, ce qui suggère que le matricule est faux. Pour le dossier PFEA900222DM0720001, le cfr est clairement érroné, nous utilisons donc le matricule qui lui permet de matcher avec un navire du registre. 
+
+
+ipca_brexit <- read.xlsx("data/raw/liste des bénéficiaires/Liste des bénéfciaires finaux IPCA Pêche.xlsx") %>%
+  row_to_names(1) %>%
+  clean_names () %>%
+  select(beneficiaire = code_nature_beneficiaire_p_m, denomination_sociale, numero_dossier = numero_de_dossier_initial, cfr = numero_de_navire, intitule_operation = intitule_de_loperation, description_operation = description_de_loperation, debut_operation = date_previsionnelle_debut_de_loperation, fin_operation = date_previsionnelle_fin_doperation, montant_aide_publique = montant_de_laide_publique, code_postal = code_postal_de_loperation, denomination_de_la_priorite_de_l_union) %>%
+  mutate(montant_aide_publique = as.numeric(montant_aide_publique)) %>%
+  mutate_at(.vars = c("debut_operation", "fin_operation"), ~as.Date(as.numeric(.), origin = "1899-12-30")) %>%
+  separate_rows(cfr, sep = "\\s") %>%
+  mutate(montant_aide_publique = ifelse(numero_dossier == "465452", montant_aide_publique/3, montant_aide_publique),
+         cfr = ifelse(!is.na(cfr), paste0("FRA000", cfr), cfr))
+
+```
+
+We merge both dataset 
+
+```{r}
+
+rab_brexit <- at_brexit %>%
+  bind_rows (ipca_brexit) %>%
+  bind_rows(pai_brexit) %>%
+  mutate(cfr = ifelse(cfr == "0", NA, cfr))
+
+rm(at_brexit, ipca_brexit, pai_brexit)
+
+```
+
+It appears that `r rab_brexit %>% filter(intitule_operation == "Arrêts temporaires Brexit") %>% summarise (subsidy = sum(montant_aide_publique)) %>% mutate(subsidy = format(subsidy, big.mark = ",")) %>% pull(subsidy)` euros were perceies under temporary cessation schemes and `r rab_brexit %>% filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>% summarise (subsidy = sum(montant_aide_publique)) %>% mutate(subsidy = format(subsidy, big.mark = ",")) %>% pull(subsidy)` euros were perceived under fleet exit plans.
+
+It appear that `r rab_brexit %>% filter(is.na(cfr)) %>% nrow ()` out of the `rab_brexit %>% nrow ()` file numbers have no cfr. It corresponds only to temporary cessation payments. 
+
+It corresponds to `r rab_brexit %>% filter(is.na(cfr)) %>% summarise(subsidy = format(sum(montant_aide_publique), big.mark = ","))` out of the `r rab_brexit %>% filter(intitule_operation == "Arrêts temporaires Brexit") %>% summarise(subsidy = format(sum(montant_aide_publique), big.mark = ","))` euros dedicated to Brexit temporary cessations. 
+
+We extract missing cfr and manually search if we can relate those beneficiaries to a vessel using "Le guide de l'Armement". It is possible only when a beneficiary is associated with a single vessel
+
+```{r}
+
+write.xlsx(rab_brexit %>%
+    filter(is.na(cfr) & !is.na(denomination_sociale)) %>%
+      select(denomination_sociale, numero_dossier), "output/missing_cfr.xlsx")
+
+```
+
+```{r}
+
+rab_brexit <- rab_brexit %>%
+  left_join(read.xlsx("data/processed/missing_cfr_cleaned.xlsx") %>%
+              clean_names () %>%
+              filter(!is.na(cfr)) %>%
+              select(numero_dossier, cfr), by = "numero_dossier") %>%
+  mutate(cfr.x = ifelse(!is.na(cfr.y), cfr.y, cfr.x)) %>%
+  rename(cfr = cfr.x) %>%
+  select(-cfr.y)
+  
+```
+
+We pull up the list of beneficiaries of fleet exit plans to find their contact details (e-mail, telephone number, etc.). The aim is to find as many contacts as possible to send questionnaires to the beneficiaries of this fleet exit plan.
+
+```{r}
+
+write.xlsx(rab_brexit %>%
+    filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+    select(denomination_sociale, code_postal, cfr, mmsi, vessel_name, gear, maritime_district, nom_departement, montant_aide_publique), "output/contacts_pecheurs.xlsx")
+
+```
+
+We load the fleet register database
+
+```{r}
+
+register <- readRDS(url("https://www.dropbox.com/scl/fi/cum69eazhft2zbfhgqi7w/clean_fleet_register_20230626.rds?rlkey=5zt0vxw964qjixvxhtjqmvldy&dl=1")) %>%
+  filter(country == "FRA" & ymd("2022-11-18") %within% interval(event_start_date, event_end_date)) # 2022-11-18 is the application deadline for the fleet exit plan
+  
+```
+
+We create a dataset with the names of French towns, their geographical coordinates and the department and region to which they belong. This data will then be combined with that from the fleet register to identify the maritime districts in which subsidized ships are located.
+
+```{r}
+
+cities <- readRDS(url("https://www.dropbox.com/scl/fi/cum69eazhft2zbfhgqi7w/clean_fleet_register_20230626.rds?rlkey=5zt0vxw964qjixvxhtjqmvldy&dl=1")) %>%
+  filter(country == "FRA" & ymd("2022-11-18") %within% interval(event_start_date, event_end_date)) %>%
+  rename(code = maritime_district) %>%
+  distinct(code) %>%
+  left_join(read.xlsx("https://www.dropbox.com/scl/fi/um515yvu064f4k7r8hu96/MDR_Vessel_Port.xlsx?rlkey=7jbgoze5nfoihkh4zst3v6k6m&dl=1") %>%
+              clean_names () %>%
+              filter(country == "FRA") %>%
+              select(code, maritime_district = en_description), by = "code") %>%
+  mutate(maritime_district = case_when(code == "FRLC5" ~ "La Cotiniere", 
+                                       maritime_district == "BOULOGNE" ~ "BOULOGNE SUR MER",
+                                       maritime_district == "CHERBOURG" ~ "CHERBOURG EN COTENTIN",
+                                       maritime_district == "SAINT-MALO" ~ "ST MALO",
+                                       maritime_district == "SAINT-BRIEUC" ~ "ST BRIEUC",
+                                       maritime_district == "SÉTE" ~ "SETE",
+                                       maritime_district == "SAINT-NAZAIRE" ~ "ST NAZAIRE",
+                                       maritime_district == "LES SABLES D'OLOGNE" ~ "LES SABLES D OLONNE",
+                                       maritime_district ==  "ÎLE D'YEU" ~ "L ILE D YEU",
+                                       maritime_district == "CAMARET" ~ "CAMARET SUR MER",
+                                       maritime_district == "FORT-DE-FRANCE" ~ "FORT DE FRANCE",
+                                       maritime_district == "POINTE-A-PITRE" ~ "POINTE A PITRE",
+                                       maritime_district == "NOIRMOUTIER" ~ "NOIRMOUTIER EN L ILE",
+                                       TRUE ~ maritime_district)) %>%
+  left_join(read_csv("data/raw/communes-departement-region.csv") %>%
+              select(maritime_district = nom_commune_postal, 
+                     sub_city = ligne_5,
+                     zip_code = code_postal,
+                     latitude, 
+                     longitude, 
+                     nom_departement, 
+                     nom_region) %>%
+              mutate(sub_city = str_to_title(sub_city),
+                     maritime_district = ifelse(is.na(sub_city), maritime_district, sub_city)) %>%
+              select(-sub_city) %>%
+              filter(!is.na(latitude)) %>% #Remove cities with no information
+              mutate(maritime_district = ifelse(maritime_district == "St Denis Chaudron", "LA RÉUNION", maritime_district), 
+                     zip_code = as.character(ifelse(zip_code < 10000, paste("0", zip_code, sep = ""), zip_code)), #Clean `zip_code` (add 0 when applicable)
+                     zip_code = ifelse(grepl(" [0-9]+", maritime_district), str_replace(zip_code, "^([0-9]{2})(.+)$", "\\1000"), zip_code), #Clean `zip_code` for cities with several districts, i.e. Paris, Lyon, and Marseille
+                     maritime_district = ifelse(grepl(" [0-9]+", maritime_district), str_remove(maritime_district, " [0-9]+"), maritime_district)) %>% #Clean `city` for cities with several districts, i.e. Paris, Lyon, and Marseille
+              with_groups(c(maritime_district, zip_code), mutate, latitude = mean(latitude), longitude = mean(longitude)) %>% #Re-calculate `lat` and `lon` for cities with several districts, i.e. Paris, Lyon, and Marseille (mean `lat` and `lon`)
+              distinct() %>%
+              arrange(maritime_district, nom_departement, nom_region) %>%
+              with_groups(c(maritime_district, nom_departement, nom_region), filter, row_number() == 1) %>%
+              filter(!(maritime_district == "ST NAZAIRE" & nom_departement %in% c("Gard", "Pyrénées-Orientales"))) %>%
+              filter(!(maritime_district == "MARENNES" & nom_departement == "Rhône")) %>%
+              filter(!(maritime_district == "LA ROCHELLE" & nom_departement == "Haute-Saône")), by = "maritime_district") 
+
+```
+
+We match the Brexit data with the register 
+
+```{r}
+
+rab_brexit <- rab_brexit %>%
+  left_join(register %>%
+              select(cfr, mmsi, vessel_name, length, tonnage_gt, gear, gear_cat, vessel_category, code = maritime_district), by = "cfr") %>%
+  left_join(cities, by = "code") %>%
+  mutate(length_class = case_when (length < 12 ~ "[0-12[ m",
+                                   length >= 12 & length <24 ~ "[12-24[ m",
+                                   length >= 24 & length<40 ~ "[24-40[ m",
+                                   length >= 40 ~ "[40-XX[ m"),
+         gear = factor(gear, levels = c("Pots", "Mechanized lines and pole-and-lines", "Trammel nets","Set gillnets (anchored)","Set longlines","Drifting longlines","Trolling lines","Purse seines","Midwater pair trawls","Midwater trawls (nei)","Single boat midwater otter trawls","Towed dredges","Danish seines","Single boat bottom otter trawls","Otter trawls (nei)","Bottom trawls (nei)","Twin bottom otter trawls","Beam trawls","Bottom trawls shrimp trawls")))
+
+```
+
+To these subsidy data we add information on the acquisition of licenses to fish in British waters and the Channel Islands.
+
+```{r}
+
+licences <- read.xlsx("data/raw/licences/EU_Vessel_List_for_UK_Waters_20221010.xlsx") %>% # downloaded here : https://www.gov.uk/guidance/united-kingdom-single-issuing-authority-uksia
+  clean_names () %>%
+  filter(flag_state == "FRA") %>%
+  select(-date_voisinage_0_6nm_start, -date_voisinage_0_6nm_end) %>%
+  full_join(read.csv("data/raw/licences/licences guernesey.csv", sep = ";") %>% # downloaded here : https://www.mer.gouv.fr/FAQ_brexit_peche
+              clean_names () %>%
+              rename(cfr = numero_cfr, 
+                     vessel_name = navire,
+                     date_guernesey_licence_start = date_debut_validite, 
+                     date_guernesey_licence_end = date_fin_validite) %>%
+              select(-vessel_name) %>%
+              mutate(guernesey_access = "Yes"), by = "cfr") %>%
+  full_join(read.csv("data/raw/licences/licences jersey.csv", sep = ";") %>% # downloaded here : https://www.mer.gouv.fr/FAQ_brexit_peche
+              clean_names () %>%
+              rename(cfr = numero_cfr_navire, 
+                     vessel_name = navire,
+                     date_jersey_licence_start = date_debut_validite, 
+                     date_jersey_licence_end = date_fin_validite) %>%
+              select(-vessel_name) %>%
+              mutate(jersey_access = "Yes"), by = "cfr") %>%
+  relocate(jersey_access, .after = voisinage_0_6nm_access) %>%
+  relocate(guernesey_access, .after = jersey_access) %>%
+  select(-voisinage_0_6nm_access, -date_full_uk_eez_licence_start:-date_jersey_licence_end)
+
+rab_brexit <- rab_brexit %>%
+    left_join(licences %>%
+                  select(cfr, uk_eez_access, uk_6_12nm_access, jersey_access, guernesey_access), by = "cfr") %>%
+   mutate_at(.vars = c("uk_eez_access", "uk_6_12nm_access", "jersey_access", "guernesey_access"), ~ifelse(is.na(.), "No", .))
+
+```
+
+# Analysis of subsidies allocated under the fleet exit plan
+
+## Distribution of the subsidies 
+
+We plot the distribution of PAI ("Plan d'accompagnement individuel") subsidies between vessel size class and gear 
+
+```{r}
+
+ggplot(data = rab_brexit %>%
+         filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+         mutate(gear = case_when(gear %in% c("Twin bottom otter trawls", "Single boat bottom otter trawls", "Beam trawls") ~ "Chalut de fond",
+                                 gear %in% c("Midwater pair trawls", "Single boat midwater otter trawls") ~ "Chalut pélagique",
+                                 gear == "Danish seines" ~"Senne démersale",
+                                 gear %in% c("Set gillnets (anchored)", "Pots", "Set longlines", "Trammel nets", "Drifting longlines", "Trolling lines") ~ "Arts dormants (casier, filet, ligne, palangre)"),
+                gear = factor(gear, levels = c("Chalut pélagique", "Senne démersale", "Chalut de fond", "Arts dormants (casier, filet, ligne, palangre)"))) %>%
+                  with_groups(c("length_class", "gear"), summarise, vessel_nb = n(), montant_aide_publique = sum(montant_aide_publique)/10^6), aes(x=length_class, y=montant_aide_publique, fill = gear)) +
+         geom_col (color = "grey0") +
+         geom_text (aes(label = vessel_nb), fontface = "bold", color = "grey100", position = position_stack(vjust = .5), size = 3) +
+         #geom_text (aes(label = label), fontface = "bold", color = "grey100", position = position_stack(vjust = .5)) +
+         labs (x="Classe de taille des navires", y ="Montant perçu (million EUR)", title = "Répartition des subventions allouées aux navires de pêche dans le cadre des\nplans d'accompagnement individuels financés par la Réserve d'ajustement Brexit", fill = "Engin de pêche") + 
+         theme_bw () %+% 
+         theme(plot.caption= element_text(hjust = 0),
+               plot.title = element_text(size=10),
+              legend.position = "bottom") +
+         scale_fill_viridis_d (direction = -1)
+
+ggsave("output/figures/barplot distribution des pai.png", width = 21, height = 17, unit = "cm")
+
+```
+
+Same plot but splited by region 
+
+```{r}
+
+ggplot(data = rab_brexit %>%
+         filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+         with_groups(c("length_class", "gear", "nom_region"), summarise, vessel_nb = n(), montant_aide_publique = sum(montant_aide_publique)/10^6), aes(x=length_class, y=montant_aide_publique, fill = gear)) +
+  geom_col (color = "grey0") +
+  geom_text (aes(label = vessel_nb), fontface = "bold", size= 3, color = "grey100", position = position_stack(vjust = .5)) +
+  facet_wrap(~nom_region) +
+  labs (x="Classe de taille des navires", y ="Montant perçu (million EUR)", title = "Répartition des subventions allouées aux navires de pêche dans le cadre des\nplans d'accompagnement individuels financés par la Réserve d'ajustement Brexit", fill = "Engin de pêche") + 
+  theme_bw () %+% 
+  theme(plot.caption= element_text(hjust = 0),
+        plot.title = element_text(size=10),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        legend.title=element_blank()) +
+  scale_fill_viridis_d ()
+
+ggsave("output/figures/barplot distribution des pai par region.png", width = 20, height = 22, unit = "cm")
+
+```
+
+Size of vessels that have received an exit plan
+
+```{r}
+
+ggplot(data = rab_brexit %>%
+    filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+    mutate(length = round(length)) %>%
+        with_groups(length, summarise, count = n()), aes(x=length, y = count)) +
+    geom_col() +
+    labs(y = "Nombre de navires", x = "Taille des navires") +
+    theme_bw()
+
+```
+
+Distribution of subsidies by maritime district
+
+```{r}
+
+data_map <- rab_brexit %>%
+    filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+    with_groups(c("maritime_district", "latitude", "longitude"), summarise, subsidy = round(sum(montant_aide_publique)/10^6,1), vessel_nb = n()) %>%
+    mutate(label = paste0(str_to_sentence(maritime_district), "\n", "(", subsidy, "M€)")) %>%
+  left_join(read.xlsx("data/processed/coordinates_map_pai.xlsx") %>%
+              select(-latitude, -longitude), by ="maritime_district")
+           
+url <- "https://www.dropbox.com/scl/fo/ux5xjf028fn1kqf76613p/AN5OKvxXWlU0TVYBuuQ-wxw?rlkey=v99hfa0kgo4x1xucrm1msjww3&dl=1"
+
+download.file(url, destfile = "data/raw/shapefiles/regions.zip")
+unzip("data/raw/shapefiles/regions.zip", exdir = "data/raw/shapefiles/")
+
+ggplot () + 
+    geom_sf(data = st_read(dsn = "data/raw/shapefiles", layer = "regions-20190101"), fill = "grey70", color = "grey50", linewidth = 0.1) +
+    geom_sf (data = data_map %>%
+                 st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+                 mutate(vessel_nb_cat = cut(vessel_nb, breaks = seq(from = 0, to = 20, by = 2), include.lowest = TRUE, right = FALSE)), aes(color = vessel_nb_cat), size = 5) +
+    geom_text(data = data_map, aes(x=long_label, y=lat_label, label=label), size = 2.2, lineheight = 0.8) +
+    geom_segment (data = data_map, aes(x=x, xend=xend, y=y, yend=yend), linewidth = 0.25) +
+    coord_sf(ylim = c(42, 53), xlim = c(-8, 8.5), expand = FALSE) +
+    scale_color_viridis_d() +
+    theme_void() %+% 
+  theme(plot.background = element_rect(fill = "grey100")) +
+  labs (color = "Nombre de navires\ndémantelés", tile = "Subventions perçues dans le cadre du plan d'accompagnement individuel")
+
+ggsave("output/figures/carte_pai.png", width = 21, height = 17, unit = "cm")
+
+```
+
+Distribution of subsidies by region
+
+```{r}
+
+write.xlsx(rab_brexit %>%
+    filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+    with_groups(nom_region, summarise, subsidy_pai = sum(montant_aide_publique), vessel_nb_pai = n(), tonnage_gt_pai = sum(tonnage_gt, na.rm = T)) %>%
+    left_join(register %>%
+    rename(code = maritime_district) %>%
+    left_join(cities, by = "code") %>%
+    filter(!is.na(nom_region)) %>%
+    with_groups(nom_region, summarise, vessel_nb_tot = n(), tonnage_gt_tot = sum(tonnage_gt, na.rm = T)), by = "nom_region") %>%
+    rowwise () %>%
+    mutate(tonnage_gt_deviation = -round((tonnage_gt_pai*100)/tonnage_gt_tot,1),
+           subsidy_per_gt = round(subsidy_pai/tonnage_gt_tot,0)) %>%
+    ungroup () %>%
+    arrange(desc(subsidy_pai)) %>%
+    select(-tonnage_gt_pai, -vessel_nb_tot, -tonnage_gt_tot) %>%
+    mutate(subsidy_pai = format(subsidy_pai, big.mark = ",")) %>%
+    rename("Région" = nom_region,
+           "Subventions\n(€)" = subsidy_pai,
+           "Navires démantelés" = vessel_nb_pai,
+           "Diminution de la capacité\nde flotte (%)" = tonnage_gt_deviation, 
+           "Montant des subventions rapporté à\nla capacité de flotte (€/GT)" = subsidy_per_gt), "output/répartition des subventions par région.xlsx") 
+
+```
+
+Distribution of subsidies by length class
+
+```{r}
+
+write.xlsx(rab_brexit %>%
+    filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+    with_groups(length_class, summarise, subsidy_pai = sum(montant_aide_publique), vessel_nb_pai = n(), tonnage_gt_pai = sum(tonnage_gt, na.rm = T)) %>%
+    left_join(register %>%
+                  rename(code = maritime_district) %>%
+                  left_join(cities, by = "code") %>%
+                  mutate(length_class = case_when (length < 12 ~ "[0-12[ m",
+                                                   length >= 12 & length <24 ~ "[12-24[ m",
+                                                   length >= 24 & length<40 ~ "[24-40[ m",
+                                                   length >= 40 ~ "[40-XX[ m")) %>%
+                  with_groups(length_class, summarise, vessel_nb_tot = n(), tonnage_gt_tot = sum(tonnage_gt, na.rm = T)), by = "length_class") %>%
+    rowwise () %>%
+    mutate(tonnage_gt_deviation = -round((tonnage_gt_pai*100)/tonnage_gt_tot,1),
+           subsidy_per_gt = round(subsidy_pai/tonnage_gt_tot,0)) %>%
+    ungroup () %>%
+    select(-tonnage_gt_pai, -vessel_nb_tot, -tonnage_gt_tot) %>%
+  mutate(subsidy_pai = format(subsidy_pai, big.mark = ",")) %>%
+    rename("Classe de taille" = length_class,
+           "Subventions\n(€)" = subsidy_pai,
+           "Navires démantelés" = vessel_nb_pai,
+           "Diminution de la capacité\nde flotte (%)" = tonnage_gt_deviation, 
+           "Montant des subventions rapporté à\nla capacité de flotte (€/GT)" = subsidy_per_gt), "output/répartition des subventions par classe de taille.xlsx") 
+
+```
+
+Brittany received by far the most subsidies.
+
+Who are the main beneficiaries of these subsidies ? 
+
+```{r}
+
+data_fig <- rab_brexit %>%
+    filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+    select(denomination_sociale, cfr, mmsi, vessel_name, montant_aide_publique) %>%
+    left_join(read.xlsx("data/processed/final_beneficiary_reconstruction.xlsx") %>%
+                  select(denomination_sociale, cfr, mmsi, vessel_name, owner)) %>%
+    with_groups(owner, summarise, montant_aide_publique = sum(montant_aide_publique), navire_n = n()) %>%
+  arrange(desc(montant_aide_publique))
+
+fifty_percent_value <- rab_brexit %>% 
+  filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+  summarise(montant_aide_publique = sum(montant_aide_publique)) %>%
+  pull(montant_aide_publique) / 2 / 10^6
+
+ggplot(data = data_fig %>%
+         mutate(montant_aide_publique_cum = round(cumsum(montant_aide_publique)*100/sum(montant_aide_publique),1),
+                owner = ifelse(montant_aide_publique_cum >=50, "", owner),
+                owner = fct_rev(owner)), aes(x= 1, fill = montant_aide_publique, y = montant_aide_publique/10^6)) +
+  geom_bar(position = "stack", stat = "identity", color = "black", linewidth = 0.1, alpha = 0.8) +
+  geom_text (aes(label = owner), color = "grey0", position = position_stack(vjust = .5), size = 2) +
+  scale_fill_viridis(option = "D", guide = "none") +
+  scale_y_continuous(expand = c(0,0)) +
+  geom_hline(yintercept = fifty_percent_value, col = "black", linetype = "dashed") +
+  annotate("text", x = 1.50, y =  fifty_percent_value+1, label = "50%", 
+           color = "black", size = 3) +
+theme_classic () %+%
+  theme(axis.title=element_text(size=8),
+        axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(x= "", y = "Montant de l'aide publique perçue par les entreprises (millions d'€)")
+
+ggsave("output/figures/beneficiaries_barplot.png", width = 12, height = 12, unit = "cm")
+
+rm(fifty_percent_value)
+
+```
+
+## Analysis of fishing effort in UK waters
+
+Via GFW trajectories (manually downloaded on the GFW platform)
+
+We extract the list of mmsi to manually download the trajectories in GFW
+
+```{r}
+
+write.xlsx(rab_brexit %>%
+  filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+  select(cfr, mmsi, vessel_name), "output/liste des navires ayant reçu un pai.xlsx")
+
+```
+
+We import AIS trajectories data, then download fishing events, and finally join the events to each AIS data point of the trajectories
+
+```{r}
+
+trajectories_gfw <- trajectory_with_events_gfw(path = paste0("data/raw/trajectories/gfw_trajectories_fra/", list.files("data/raw/trajectories/gfw_trajectories_fra"), "/data.csv"), 
+                                               start_date = "2018-01-01", 
+                                               end_date = "2022-12-31", 
+                                               token_gfw = gfw_auth())
+
+```
+
+```{r}
+
+trajectories_summary <- fishing_eez_summary(data = trajectories_gfw, 
+                                            eez = eez, 
+                                            start_date = "2019-01-01", 
+                                            end_date = "2020-12-31") %>%
+  mutate(uk_guernsey_jersey_eez = rowSums(select(., c("united_kingdom_eez", "guernsey_eez", "jersey_eez"))))
+
+```
+
+Among the `r rab_brexit %>% filter (intitule_operation == "Plan d'accompagnement individuel Brexit") %>% nrow ()` that received a PAI, we were able to download the trajectories for `r trajectories_gfw %>% distinct(vessel_mmsi) %>% nrow ()` vessels. 
+
+Let's plot AIS track in order to visualize the completeness of the AIS data for each vessel. 
+
+```{r}
+
+data_fig_ais_track <- expand.grid(tibble(date_from = ymd("2019-01-01"),
+                           date_to = ymd("2020-12-31")) %>%
+                        mutate(date = map2(date_from, date_to, seq.Date, by = 1)) %>%
+                        unnest(cols = c(date)) %>%
+                        select(date) %>%
+                        pull(date),
+                    trajectories_gfw %>%
+                        distinct(vessel_mmsi) %>%
+                        pull(vessel_mmsi)) %>%
+    rename(date = Var1, vessel_mmsi = Var2) %>%
+    arrange(vessel_mmsi, date) %>%
+    left_join(trajectories_gfw %>%
+                filter(year(timestamp) %in% c(2019, 2020)) %>%
+                  mutate(date = as.Date(timestamp)) %>%
+                  distinct(vessel_mmsi, date) %>%
+                  mutate(count_ais = 1), by = c("vessel_mmsi", "date")) %>%
+  mutate(year = year(date)) %>%
+  with_groups(c("vessel_mmsi", "year"), mutate, ais_perc = round(sum(count_ais, na.rm = T)*100/365,0)) %>%
+  pivot_wider(names_from = year, values_from = ais_perc, names_prefix = "ais_") %>%
+  group_by(vessel_mmsi) %>%
+  fill(ais_2019, ais_2020, .direction ="downup") %>%
+  mutate(vessel_label = paste0(vessel_mmsi, " (2019 = ", ais_2019, "% ; 2020 = ", ais_2020, "%)"))
+
+ggplot(data = data_fig_ais_track, aes(x=date, y=count_ais)) +
+    geom_line(aes(color=vessel_mmsi)) +
+    facet_wrap(~vessel_label, ncol = 3) +
+    guides(color = "none") +
+    theme_void() +
+  theme(plot.background = element_rect(fill = "grey100")) 
+
+ggsave("output/figures/ais_data.png", width = 21, height = 20, unit = "cm")
+
+```
+
+Analysis of these trajectories shows that at least `r trajectories_summary %>% with_groups(vessel_mmsi, filter, uk_guernsey_jersey_eez == max(uk_guernsey_jersey_eez)) %>% with_groups(vessel_mmsi, slice, 1) %>% filter(uk_guernsey_jersey_eez <= 20) %>% nrow ()` out of these `r trajectories_gfw %>% distinct(vessel_mmsi) %>% nrow ()` vessels fished less than 20% of their time in the waters of Great Britain and the Channel Islands.
+
+Here is a table summarizing the percent of time these vessels spent fishing in the waters of Great Britain and the Channel Islands.
+
+Table summarizing the proportion of time spent by vessels fishing in the waters of Great Britain and the Channel Islands. Only the year with the highest proportion of time spent fishing in uk waters is presented.
+
+```{r}
+
+trajectories_summary %>% 
+  mutate(effort_all = round(effort_all, 1)) %>%
+  with_groups(vessel_mmsi, filter, uk_guernsey_jersey_eez == max(uk_guernsey_jersey_eez)) %>%
+  with_groups(vessel_mmsi, slice, 1) %>% # when the percent of fishing time in uk waters is the same between the two years
+  arrange(desc(uk_guernsey_jersey_eez)) %>%
+  left_join(rab_brexit %>%
+              select(vessel_mmsi = mmsi, maritime_district, gear, length) %>% # we add vessel characteristics
+              distinct(), by = "vessel_mmsi") %>%
+  select(vessel_mmsi, vessel_name, year, total_effort_days = effort_all, fishing_uk_waters_perc = uk_guernsey_jersey_eez) %>%
+  kable () %>%
+  kable_paper(full_width = T)
+
+```
+
+
+```{r}
+
+data_fig <- trajectories_summary  %>% 
+  with_groups(vessel_mmsi, filter, uk_guernsey_jersey_eez == max(uk_guernsey_jersey_eez)) %>%
+  with_groups(vessel_mmsi, slice, 1) %>% 
+  mutate(vessel_label = paste0(vessel_name, " (mmsi = ", vessel_mmsi, ")_", year)) %>%
+  arrange(desc(uk_guernsey_jersey_eez)) %>%
+  mutate(vessel_label = fct_inorder(factor(vessel_label))) %>%
+  left_join (data_fig_ais_track %>%
+               distinct(vessel_mmsi, ais_2019, ais_2020) %>%
+               pivot_longer(c(ais_2019, ais_2020), names_to = "year", values_to = "ais_completeness") %>%
+               mutate(year = as.numeric(substr(year, start = 5, stop = 8))), by =c("year", "vessel_mmsi"))
+
+ggplot (data = data_fig, aes(x = vessel_label, y = uk_guernsey_jersey_eez)) +
+    geom_col (fill = "#276091", color = "grey100") +
+    geom_text(aes(label = paste0(ais_completeness, "%")),angle = 90, hjust = -0.2, size = 2) +
+    geom_hline(yintercept = 20, col = "red") +
+    annotate(
+        "rect",
+        xmin = which(data_fig %>% pull(uk_guernsey_jersey_eez) <=20)[1] - 0.5,
+        xmax = nrow(data_fig) + 0.5,
+        ymin = 0, 
+        ymax = 20, 
+        fill = "red",
+        alpha = 0.2) +
+    theme_classic () +
+    labs (y = "Temps passé à pêcher dans les eaux britanniques (%)", x = "Navires de pêche") +
+    theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1, size = 5),
+          axis.title = element_text(size=8)) +
+    scale_y_continuous(expand = c(0,0), limits = c(0,107), breaks = c(0,20,40, 60, 80, 100))
+
+ggsave("output/figures/percentage of time spent fishing in UK waters.png", width = 17, height = 12, unit = "cm")
+
+rm(data_fig)
+
+```
+
+Trajectories maps for vessels fishing less than 20% of their time in British waters 
+
+```{r}
+
+sf_use_s2(FALSE)
+
+fig_trajectories <- trajectories_gfw %>%
+  mutate(year = year(timestamp)) %>%
+  left_join(data_fig %>%
+              filter(uk_guernsey_jersey_eez <= 20) %>%
+              select(vessel_mmsi, year) %>%
+              mutate(match = TRUE), by = c("vessel_mmsi", "year")) %>%
+  filter(match == TRUE) %>%
+  st_as_sf (coords = c("lon", "lat"), crs = 4326) %>%
+  select(vessel_name, vessel_mmsi, timestamp, event) %>%
+  with_groups(vessel_mmsi, mutate, geometry_lead = lead(geometry)) %>%
+  with_groups(vessel_mmsi, slice, -n()) %>%
+  mutate(geometry_line = st_sfc(purrr::map2(.x = geometry, .y = geometry_lead, .f = ~{st_union(c(.x, .y)) %>% st_cast("LINESTRING")}), crs = 4326)) %>%
+  select(-geometry_lead) %>%
+  mutate(event = ifelse(is.na(event), "transit", event)) %>%
+  st_set_geometry("geometry_line")
+
+```
+
+We plot the trajectories for all vessel which spent less than 20% of their fishing time in UK waters 
+
+```{r}
+
+vessel <- fig_trajectories %>% distinct(vessel_mmsi) %>% pull (vessel_mmsi) 
+eez_bis <- st_read(dsn = "data/raw/shapefiles/World_EEZ_v11_20191118", layer = "eez_v11", quiet = T) %>%
+                clean_names () %>%
+                filter (mrgid %in% c(5677, 5696, 21788, 21789, 5681, 5693, 48966, 3293))
+
+for (i in 1:nrow(fig_trajectories %>% distinct(vessel_mmsi))) {
+    
+    ggplot () +
+      geom_sf(data = eez_bis, fill = "#2E5F7F", color = "grey50", linewidth = 0.4) +
+      geom_sf(data = ne_countries(scale = 10, continent = "europe", returnclass = "sf"), fill = "grey70", color = "grey50", linewidth = 0.2) +
+      geom_sf (data = fig_trajectories %>% filter(vessel_mmsi == vessel[i]), aes(color = event)) +
+      scale_colour_manual(values = c("#f7a602", "white")) +
+      coord_sf(ylim = c(42.2, 53.7), xlim = c(-14.7, 2.5), expand = FALSE) +
+      theme_void() +
+      theme(plot.background = element_rect(fill='white')) +
+      guides(color = "none") 
+    
+    ggsave(paste0("output/figures/trajectories/trajectory_", vessel[i], ".png"), width = 21, height = 21, units = "cm")
+    
+}
+
+rm(eez_bis)
+
+```
+
+## Estimate past vessel activity (90 days criterion test check)
+
+To be eligible, vessels must have operated for at least 90 days a year in 2020 and 2022, either the two years preceding the grant application.
+
+Here we test whether this eligibility criterion has been met.
+
+```{r}
+
+test_criterion_90days <- expand.grid(tibble(date_from = ymd("2020-01-01"),
+                           date_to = ymd("2021-12-31")) %>%
+                      mutate(date = map2(date_from, date_to, seq.Date, by = 1)) %>%
+                      unnest(cols = c(date)) %>%
+                      select(date) %>%
+                      pull(date),
+                    trajectories_gfw %>%
+                      distinct(vessel_mmsi) %>%
+                      pull(vessel_mmsi)) %>%
+  rename(date = Var1, vessel_mmsi = Var2) %>%
+  arrange(vessel_mmsi, date)
+
+
+test_criterion_90days <- test_criterion_90days %>%
+  left_join(trajectories_gfw %>%
+              filter(event == "fishing" & year(timestamp) %in% c(2020, 2021)) %>%
+              mutate(date = as.Date(timestamp)) %>%
+              distinct(vessel_mmsi, date) %>%
+              mutate(count_ais_fishing = 1), by = c("vessel_mmsi", "date")) %>%
+  left_join(trajectories_gfw %>%
+              filter(year(timestamp) %in% c(2020, 2021)) %>%
+              mutate(date = as.Date(timestamp)) %>%
+              distinct(vessel_mmsi, date) %>%
+              mutate(count_ais = 1), by = c("vessel_mmsi", "date")) %>%
+  mutate(year = year(date)) %>%
+  with_groups (c("vessel_mmsi", "year"), summarise, fishing_days = sum(count_ais_fishing, na.rm = T), ais_on_days = sum(count_ais, na.rm = T), ais_on_days_perc = round(sum(count_ais, na.rm = T)*100/365,1)) %>%
+  rowwise () %>%
+  mutate(ais_off_days = 365-ais_on_days,
+         fishing_days_max = sum(fishing_days, ais_off_days)) %>%
+  arrange(desc(fishing_days))
+
+
+test_criterion_90days %>%
+  kable () %>%
+  kable_paper(full_width = T)
+```
+
+This analysis shows that of the `r trajectories_gfw %>% distinct(vessel_mmsi) %>% nrow ()` vessels with an AIS track, at least `r test_criterion_90days %>% filter(fishing_days<90) %>% distinct(vessel_mmsi) %>% nrow ()` are unable to prove from their AIS data that they have been fishing for at least 90 days in 2019 and 2020. Nevertheless, most vessels have an incomplete AIS track (as they intermittently switch off their beacons). Assuming that on the days when the AIS is switched off, these vessels are fishing (the most conservative assumption), this leaves `r test_criterion_90days %>% filter(fishing_days_max<90) %>% distinct(vessel_mmsi) %>% nrow ()` vessel that has not met this eligibility criterion. The mmsi of this vessel is `r test_criterion_90days %>% filter(fishing_days_max<90) %>% distinct(vessel_mmsi) %>% pull (vessel_mmsi)`. The map in the GFW platform confirms this vessel has no gap in its AIS track and confirm this vessel has not respected the criterion of eligibility. For the other vessels, doubt persists due to the absence of complete AIS data.
+
+Let's represent these result via a stacked barplot 
+
+```{r}
+
+ggplot(data = test_criterion_90days %>%
+         left_join(trajectories_gfw %>%
+                     distinct(vessel_mmsi, vessel_name), by = "vessel_mmsi") %>%
+         filter(fishing_days < 90) %>%
+         mutate(label = paste0(vessel_name, " (", vessel_mmsi, ")_", year)) %>%
+         arrange(desc(fishing_days)) %>%
+         mutate(label = fct_inorder(label)) %>%
+         left_join(rab_brexit %>%
+                     filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+                     distinct(mmsi, length) %>%
+                     rename(vessel_mmsi = mmsi), by = "vessel_mmsi") %>%
+         filter(length > 15), aes(x=label)) + # we keep only vessel larger than 15 meters because AIS is mandatory only for those vessels according to EU laws
+  geom_bar(aes(y = fishing_days_max), position="stack", stat="identity", fill = "grey", alpha = 0.5, color = "white") +
+  geom_bar(aes(y = fishing_days), position="stack", stat="identity", fill = "#2E5F7F", color = "white") +
+  geom_hline(yintercept = 90, col = "black", linetype = "dashed") +
+  annotate("text", x = 33, y =  90, label = "90 jours\nde pêche", 
+           color = "black", size = 3) +
+  coord_cartesian(clip = "off") +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_bw () +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = margin(0, 20, 0, 0)) +
+  labs(x="", y = "Nombre de jours de pêche en mer")
+
+ggsave("output/figures/test_criterion_90days.png", width = 17, height = 17, unit = "cm")
+
+```
+
+List of vessel with an AIS record and their length
+
+```{r}
+
+trajectories_gfw %>%
+    distinct(vessel_name, vessel_mmsi) %>%
+    left_join(rab_brexit %>%
+                  filter (intitule_operation == "Plan d'accompagnement individuel Brexit") %>%
+                  select(vessel_mmsi = mmsi, length), by = "vessel_mmsi") %>%
+    arrange(desc(length)) %>%
+  kable () %>%
+  kable_paper(full_width = T)
+
+```
+
+## Dependence of French fishermen on fish stocks listed in appendix 4 of the decree
+
+Based on the above analyses, it appears that some vessels did not fish in UK waters during the Order's 2019 and 2020 reference years. These vessels may nevertheless benefit from an exit plan if they can demonstrate dependence on certain stocks listed in Appendix 4 of the Order. Let's now look at whether the French quota share for these stocks has decreased as a result of the Brexit, which would therefore have negative consequences for French fishermen that would motivate an exit plan from the fleet. The Cooperation and Trade Agreement provides for a gradual reduction in the quota share allocated to Europe (and therefore to France) for a number of stocks listed in Appendix 4 of the Order. 
+
+```{r}
+
+shared_stocks <- read.xlsx("/Users/augustinlafond/BLOOM Dropbox/Recherche/PROGRAMMES/Subventions/0-ARCHIVES/7-Brexit PSF/code R/code Augustin/data/processed/evolution des possibilités des peche/TCA liste des stocks.xlsx", sheet = 1) %>%
+    clean_names() %>%
+    mutate_at(.vars = 5:16, ~as.numeric(.)) %>%
+  left_join(read.xlsx("/Users/augustinlafond/BLOOM Dropbox/Recherche/PROGRAMMES/Subventions/0-ARCHIVES/7-Brexit PSF/code R/code Augustin/data/processed/evolution des possibilités des peche/TCA liste des stocks.xlsx", sheet = 2) %>%
+    clean_names() %>%
+    select(stock_id, ue_2020, ru_2020), by = "stock_id") %>%
+  filter(listed_in_annex_4 == TRUE) %>%
+  select(-listed_in_annex_4) %>%
+  pivot_longer(cols = c(ue_2021:ru_2020), names_to = "name", values_to = "part") %>%
+    mutate(year = as.numeric(substr(name, start = 4, stop = 7)),
+           state = substr(name, start = 1, stop = 2)) %>%
+    select(-name) %>%
+    relocate(part, .after = state) %>%
+  arrange(stock_id, year) %>%
+  filter(state == "ue")
+
+```
+
+```{r}
+
+shared_stocks_analysis <- shared_stocks %>%
+  filter(year %in%c(2020, 2026)) %>%
+  pivot_wider (names_from = year, values_from = part) %>%
+  filter(!is.na(`2020`)) %>%
+  rowwise () %>%
+  mutate(transfert_perc = `2026` - `2020`) %>%
+  ungroup () %>%
+  arrange(transfert_perc) %>%
+  left_join(read.xlsx("/Users/augustinlafond/BLOOM Dropbox/Recherche/PROGRAMMES/Subventions/0-ARCHIVES/7-Brexit PSF/code R/code Augustin/data/processed/evolution des possibilités des peche/TCA liste des stocks.xlsx", sheet = 2) %>%
+    clean_names() %>%
+    select(stock_id, code, quota_eu_uk_2020 = quota_ue_avec_uk, fra_quota_share_within_eu = fra_2020), by = c("stock_id", "code")) %>%
+  select(-state, -`2020`, -`2026`) %>%
+  relocate(quota_eu_uk_2020, .before = transfert_perc) %>%
+  rowwise () %>%
+  mutate(quota_lost_for_eu = round((transfert_perc/100)*quota_eu_uk_2020,1)) %>%
+  mutate(quota_lost_for_fra = round((fra_quota_share_within_eu/100)*quota_lost_for_eu,1)) %>%
+  ungroup () %>%
+  relocate(fra_quota_share_within_eu, .after = quota_lost_for_eu) 
+
+```
+
+Heat map showing reduction in EU TAC share and quota expected by 2026
+
+```{r}
+
+p1 <- ggplot(data = shared_stocks_analysis %>%
+               mutate(quota_lost_for_eu = ifelse(quota_lost_for_eu > 0, 0, quota_lost_for_eu),
+                      quota_lost_for_fra = ifelse(quota_lost_for_fra > 0, 0, quota_lost_for_fra),
+                      transfert_perc = ifelse(transfert_perc > 0, 0, transfert_perc)) %>% 
+               arrange(desc(quota_lost_for_fra)) %>%
+               mutate(stock = paste0(str_remove(nom_commun, "\r\n"), "_", code),
+                      stock = fct_inorder(stock)) %>%
+               select(stock, quota_lost_for_fra, transfert_perc, quota_lost_for_eu), aes(y=stock, x = "Réduction des quotas de la France (tonnes)")) +
+  geom_tile(aes(fill = quota_lost_for_fra)) +
+  scale_fill_viridis_c(option = "rocket", begin = 0.4, limits = c(-4100,0)) +
+  geom_text(aes(label = format(round(quota_lost_for_fra, 0), big.mark = " ")), size = 3) +
+  labs(x = "", y = "") + 
+  theme_classic () +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        axis.text.y = element_text(size = 6)) +
+  guides (fill = 'none')
+
+
+p2 <- ggplot(data = shared_stocks_analysis %>%
+               mutate(quota_lost_for_eu = ifelse(quota_lost_for_eu > 0, 0, quota_lost_for_eu),
+                      quota_lost_for_fra = ifelse(quota_lost_for_fra > 0, 0, quota_lost_for_fra),
+                      transfert_perc = ifelse(transfert_perc > 0, 0, transfert_perc)) %>% 
+               arrange(desc(quota_lost_for_fra)) %>%
+               mutate(stock = paste0(str_remove(nom_commun, "\r\n"), "_", code),
+                      stock = fct_inorder(stock)) %>%
+               select(stock, quota_lost_for_fra, transfert_perc, quota_lost_for_eu), aes(y=stock, x = "Réduction des parts de TAC de l'UE (%)")) +
+  geom_tile(aes(fill = transfert_perc)) +
+  scale_fill_gradient(high = "white", low = "#0c6915", limits = c(-36,0)) +
+  geom_text(aes(label = paste0(round(transfert_perc, 1), "%")), size = 3) +
+  labs(x = "", y = "") + 
+  theme_classic () +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  guides (fill = 'none')
+
+p3 <- ggplot(data = shared_stocks_analysis %>%
+               mutate(quota_lost_for_eu = ifelse(quota_lost_for_eu > 0, 0, quota_lost_for_eu),
+                      quota_lost_for_fra = ifelse(quota_lost_for_fra > 0, 0, quota_lost_for_fra),
+                      transfert_perc = ifelse(transfert_perc > 0, 0, transfert_perc)) %>% 
+               arrange(desc(quota_lost_for_fra)) %>%
+               mutate(stock = paste0(str_remove(nom_commun, "\r\n"), "_", code),
+                      stock = fct_inorder(stock)) %>%
+               select(stock, quota_lost_for_fra, transfert_perc, quota_lost_for_eu), aes(y=stock, x = "Réduction des quotas de l'UE (tonnes)")) +
+  geom_tile(aes(fill = quota_lost_for_eu)) +
+  scale_fill_gradient(high = "white", low = "#156082", limits = c(-40100,0)) +
+  geom_text(aes(label = format(round(quota_lost_for_eu, 0), big.mark = " ")), size = 3) +
+  labs(x = "", y = "") + 
+  theme_classic () +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  guides (fill = 'none')
+
+merge <- ggarrange(p1, p2, p3,
+          nrow = 1)
+
+ggsave(merge, filename = "output/figures/évolution des possibilités de pêche pour l'UE.png", width = 21, height = 29.7, units = "cm")
+
+```
+
+Estimated amount of individual support plan
+
+```{r}
+
+montant_at <- rab_brexit %>%
+  filter(intitule_operation == "Arrêts temporaires Brexit" & !is.na(cfr)) %>%
+  with_groups(cfr, summarise, montant_at = sum(montant_aide_publique,na.rm = T))
+
+montant_ipca <- rab_brexit %>%
+  filter(intitule_operation == "IPCA Pêche" & !is.na(cfr)) %>%
+  with_groups(cfr, summarise, montant_ipca = sum(montant_aide_publique,na.rm = T))
+
+rab_brexit <- rab_brexit %>%
+  filter(intitule_operation != "Plan d'accompagnement individuel Brexit") %>%
+  bind_rows(rab_brexit %>%
+              filter(intitule_operation == "Plan d'accompagnement individuel Brexit") %>% 
+              left_join(montant_at, by = "cfr") %>%
+              left_join(montant_ipca, by = "cfr") %>%
+              mutate(montant_at = ifelse(is.na(montant_at), 0,montant_at),
+                     montant_ipca = ifelse(is.na(montant_ipca), 0, montant_ipca)) %>%
+              rowwise () %>%
+              mutate(estimated_amount_of_aid_pai = case_when(tonnage_gt < 5 ~ 94500 + tonnage_gt*8100 - montant_at - montant_ipca,
+                                                             tonnage_gt >= 5 & tonnage_gt < 20 ~ 63801+15740*tonnage_gt - montant_at - montant_ipca,
+                                                             tonnage_gt >= 20 & tonnage_gt < 300 ~ 316271+3645*tonnage_gt - montant_at - montant_ipca,
+                                                             tonnage_gt >= 300 & tonnage_gt < 800 ~ 716182+2417*tonnage_gt - montant_at - montant_ipca,
+                                                             tonnage_gt >= 800 & tonnage_gt < 1000 ~ 1755682+1310*tonnage_gt - montant_at - montant_ipca,
+                                                             tonnage_gt >= 1000 ~ 2929500 - montant_at - montant_ipca)) %>%
+              ungroup () %>%
+              select(-montant_at, -montant_ipca)) %>%
+   relocate(estimated_amount_of_aid_pai, .after = montant_aide_publique)
+
+rm(montant_at, montant_ipca)
+
+```
+
+Comparison between the estimated amounts of the individual support plan and the amounts actually received by companies
+
+```{r}
+ggplot(data = rab_brexit, aes(x = estimated_amount_of_aid_pai/10^6, y = montant_aide_publique/10^6)) +
+    geom_point(color = "blue", size = 3) +
+    geom_abline(slope = 1, intercept = 0,  
+                color = "red", linetype = "dashed", size = 1) +
+    labs(x = "Estimated amount of subsidies (PAI)",
+         y = "Amount of subsidies (PAI)") +
+    theme_minimal()    
+```
+
