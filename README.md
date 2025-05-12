@@ -4,7 +4,7 @@ This repository contains the code and the data used to produce the analysis publ
 
 📎 Full report
 The report based on this work is available here :
-👉 [Link to PDF report](https://bloomassociation.org/wp-content/uploads/2025/04/Rapport-Breizhit.pdf)
+👉 (https://bloomassociation.org/wp-content/uploads/2025/04/Rapport-Breizhit.pdf)
 
 ## 📊 Data used
 
