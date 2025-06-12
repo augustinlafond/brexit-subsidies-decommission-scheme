@@ -2,9 +2,7 @@
 
 This repository contains the code and the data used to produce the analysis published by [BLOOM](https://www.bloomassociation.org) on the allocation of French public aid to the fisheries sector under the **Plan d'Accompagnement Individuel (PAI)**, set up to compensate shipowners affected by the Brexit. This fleet exit plan, backed by 58 million euros, financed the dismantling of 86 fishing vessels in 2023.
 
-📎 Full report
-
-👉 [Lien vers le rapport PDF](https://bloomassociation.org/wp-content/uploads/2025/04/Rapport-Breizhit.pdf)
+👉 [Full report](https://bloomassociation.org/wp-content/uploads/2025/04/Rapport-Breizhit.pdf)
 
 ## 📊 Data used
 
